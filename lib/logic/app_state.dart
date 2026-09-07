@@ -58,6 +58,40 @@ class AppState extends ChangeNotifier {
       UserAccount(id: 'u1', username: 'admin', password: '123', role: 'Admin'),
       UserAccount(id: 'u2', username: 'operator', password: '123', role: 'User'),
     ]);
+
+    if (sources.isEmpty) {
+      sources.addAll([
+        Device(id: 'demo_tx_1', name: 'Main Camera', ip: '192.168.1.101', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[0], previewUrl: 'hdmi.png'),
+        Device(id: 'demo_tx_2', name: 'Presenter Laptop', ip: '192.168.1.102', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[1], previewUrl: 'hdmi.png'),
+        Device(id: 'demo_tx_3', name: 'Document Camera', ip: '192.168.1.103', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[2], previewUrl: 'hdmi.png'),
+        Device(id: 'demo_tx_4', name: 'Media Server', ip: '192.168.1.104', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[3], previewUrl: 'hdmi.png'),
+        Device(id: 'demo_tx_5', name: 'Remote Feed', ip: '192.168.1.105', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[4], previewUrl: 'hdmi.png'),
+        Device(id: 'demo_tx_6', name: 'Evidence Display', ip: '192.168.1.106', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[5], previewUrl: 'hdmi.png'),
+      ]);
+    }
+
+    if (destinationsByLocation.isEmpty) {
+      final demoDestinations = {
+        'Courtroom A': [
+          Device(id: 'demo_rx_1', name: 'Main Display', ip: '192.168.1.201', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom A', tags: ['Demo']),
+          Device(id: 'demo_rx_2', name: 'Side Display', ip: '192.168.1.202', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom A', tags: ['Demo']),
+        ],
+        'Courtroom B': [
+          Device(id: 'demo_rx_3', name: 'Main Display', ip: '192.168.1.203', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom B', tags: ['Demo']),
+          Device(id: 'demo_rx_4', name: 'Witness Screen', ip: '192.168.1.204', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom B', tags: ['Demo']),
+        ],
+        'Conference Room': [
+          Device(id: 'demo_rx_5', name: 'Projector', ip: '192.168.1.205', type: DeviceType.rx, status: DeviceStatus.online, location: 'Conference Room', tags: ['Demo']),
+          Device(id: 'demo_rx_6', name: 'Side Monitor', ip: '192.168.1.206', type: DeviceType.rx, status: DeviceStatus.online, location: 'Conference Room', tags: ['Demo']),
+        ],
+        'Lobby': [
+          Device(id: 'demo_rx_7', name: 'Reception Display', ip: '192.168.1.207', type: DeviceType.rx, status: DeviceStatus.online, location: 'Lobby', tags: ['Demo']),
+        ],
+      };
+      for (final entry in demoDestinations.entries) {
+        destinationsByLocation[entry.key] = entry.value;
+      }
+    }
   }
 
   // ── Database Load (called once on app start) ───────────────────────────────

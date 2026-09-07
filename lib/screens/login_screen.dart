@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
-import '../widgets/app_shell.dart';
+import 'server_setup_screen.dart';
 import '../logic/app_state.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -39,7 +39,7 @@ class _LoginScreenState extends State<LoginScreen> {
       if (mounted) {
         Navigator.pushReplacement(
           context,
-          MaterialPageRoute(builder: (context) => AppShell(isAdmin: matchedUser.role == 'Admin')),
+          MaterialPageRoute(builder: (context) => ServerSetupScreen(isAdmin: matchedUser.role == 'Admin')),
         );
       }
     } catch (_) {

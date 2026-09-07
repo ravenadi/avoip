@@ -3,7 +3,7 @@ import 'dart:math';
 import '../theme/app_theme.dart';
 import '../logic/app_state.dart';
 import '../models/device_model.dart';
-import '../services/node_query_service.dart';
+import '../services/device_api_service.dart';
 import '../services/database_service.dart';
 
 // Using global DeviceType from models/device_model.dart
@@ -130,7 +130,7 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
       _devices.clear();
     });
 
-    final found = await NodeQueryService.discover(
+    final found = await DeviceApiService.fetchDevices(
       onStatus: (status) {
         if (mounted) setState(() => _scanStatus = status);
       },

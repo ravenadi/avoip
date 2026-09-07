@@ -195,6 +195,7 @@ class _OperateModuleState extends State<OperateModule> {
     // Look up the real IPs for TX and RX
     final source = _sources.firstWhere((s) => s.id == sourceId);
     final dest = _allDestinations.firstWhere((d) => d.id == destId);
+    debugPrint('[OperateModule] _changeRoute: TX "${source.name}" (${source.id}) ip=${source.ip}  →  RX "${dest.name}" (${dest.id}) ip=${dest.ip}');
 
     // Fire the hardware command to both TX and RX in the background
     AVCommandService.routeVideo(txIp: source.ip, rxIp: dest.ip).then((success) {
@@ -225,6 +226,60 @@ class _OperateModuleState extends State<OperateModule> {
         ),
       );
     });
+  }
+
+  // Single receiver → /commands/set. Multiple receivers → /commands/set/batch.
+  Future<void> _applyMultiRoute(Device source, List<String> destIds) async {
+    if (destIds.isEmpty) return;
+    final dests = destIds.map((id) => _allDestinations.firstWhere((d) => d.id == id)).toList();
+    debugPrint('[OperateModule] _applyMultiRoute: TX "${source.name}" (${source.id}) ip=${source.ip}  →  ${dests.length} receiver(s)');
+    for (final dest in dests) {
+      debugPrint('[OperateModule]   RX "${dest.name}" (${dest.id}) ip=${dest.ip}');
+    }
+
+    final success = dests.length == 1
+        ? await AVCommandService.routeVideo(txIp: source.ip, rxIp: dests.first.ip)
+        : await AVCommandService.routeVideoBatch(
+            txIp: source.ip,
+            rxIps: dests.map((d) => d.ip).toList(),
+          );
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(
+              success ? Icons.bolt_rounded : Icons.warning_amber_rounded,
+              color: Colors.black,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                success
+                    ? '${source.name} routed to ${dests.length} receiver${dests.length == 1 ? '' : 's'}.'
+                    : 'UI updated — hardware unreachable.',
+                style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: success ? Colors.greenAccent.shade400 : Colors.orangeAccent,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+      ),
+    );
+  }
+
+  // Tell the backend to stop whatever is currently routed to these receivers.
+  Future<void> _stopRoutes(List<String> destIds) async {
+    if (destIds.isEmpty) return;
+    for (final destId in destIds) {
+      final dest = _allDestinations.firstWhere((d) => d.id == destId);
+      debugPrint('[OperateModule] _stopRoutes: RX "${dest.name}" (${dest.id}) ip=${dest.ip}');
+      await AVCommandService.stopRoute(rxIp: dest.ip);
+    }
   }
 
   @override
@@ -1090,18 +1145,21 @@ class _OperateModuleState extends State<OperateModule> {
                     ),
                     ElevatedButton(
                       onPressed: () {
+                        final destIdsToRoute = <String>[];
+                        final destIdsToStop = <String>[];
                         for (final entry in selectedDests.entries) {
                           if (entry.value) {
                             AppState.instance.activeRoutes[entry.key] = source.id;
-                            // Fire hardware command for each selected destination
-                            final dest = _allDestinations.firstWhere((d) => d.id == entry.key);
-                            AVCommandService.routeVideo(txIp: source.ip, rxIp: dest.ip);
+                            destIdsToRoute.add(entry.key);
                           } else if (_activeRoutes[entry.key] == source.id) {
                             AppState.instance.activeRoutes[entry.key] = null;
+                            destIdsToStop.add(entry.key);
                           }
                         }
                         AppState.instance.notifyListeners();
                         Navigator.pop(ctx);
+                        _applyMultiRoute(source, destIdsToRoute);
+                        _stopRoutes(destIdsToStop);
                       },
                       style: ElevatedButton.styleFrom(backgroundColor: Colors.greenAccent, foregroundColor: Colors.black, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
                       child: const Text('Apply Routes', style: TextStyle(fontWeight: FontWeight.bold)),

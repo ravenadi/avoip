@@ -29,6 +29,7 @@ class _UsersModuleState extends State<UsersModule> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setStateDialog) => AlertDialog(
+          scrollable: true,
           backgroundColor: AppTheme.backgroundLight,
           title: const Text('Provision New User', style: TextStyle(color: AppTheme.accentWhite)),
           content: Column(
@@ -46,7 +47,7 @@ class _UsersModuleState extends State<UsersModule> {
               ),
               const SizedBox(height: 16),
               DropdownButtonFormField<String>(
-                value: selectedRole,
+                initialValue: selectedRole,
                 dropdownColor: AppTheme.backgroundLight,
                 style: const TextStyle(color: Colors.white),
                 items: ['Admin', 'User'].map((String value) {
@@ -127,6 +128,7 @@ class _UsersModuleState extends State<UsersModule> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setStateDialog) => AlertDialog(
+          scrollable: true,
           backgroundColor: AppTheme.backgroundLight,
           title: const Text('Edit User Access', style: TextStyle(color: AppTheme.accentWhite)),
           content: Column(
@@ -144,7 +146,7 @@ class _UsersModuleState extends State<UsersModule> {
               ),
               const SizedBox(height: 16),
               DropdownButtonFormField<String>(
-                value: selectedRole,
+                initialValue: selectedRole,
                 dropdownColor: AppTheme.backgroundLight,
                 style: const TextStyle(color: Colors.white),
                 items: ['Admin', 'User'].map((String value) {
@@ -232,7 +234,7 @@ class _UsersModuleState extends State<UsersModule> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     const Text(
-                                      'Access Control',
+                                      'User Management',
                                       style: TextStyle(
                                         fontSize: 28,
                                         fontWeight: FontWeight.bold,
@@ -259,7 +261,7 @@ class _UsersModuleState extends State<UsersModule> {
                                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                   children: [
                                     const Text(
-                                      'Access Control',
+                                      'User Management',
                                       style: TextStyle(
                                         fontSize: 28,
                                         fontWeight: FontWeight.bold,

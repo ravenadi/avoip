@@ -1,6 +1,10 @@
 import 'package:flutter/foundation.dart';
+import '../config/api_config.dart';
 import '../models/device_model.dart';
+import '../modules/discovery_module.dart';
 import '../services/database_service.dart';
+import '../services/device_api_service.dart';
+import '../services/snapshot_service.dart';
 
 class UserAccount {
   final String id;
@@ -16,10 +20,21 @@ class UserAccount {
   });
 }
 
+/// Ids of the main menu tabs, used to switch tabs from anywhere.
+class AppTabs {
+  static const discovery = 'discovery';
+  static const configuration = 'configuration';
+  static const operate = 'operate';
+  static const snapshots = 'snapshots';
+  static const users = 'users';
+  static const utilities = 'utilities';
+  static const help = 'help';
+}
+
 class AppState extends ChangeNotifier {
   static final AppState instance = AppState._internal();
   AppState._internal() {
-    initializeSampleData();
+    _seedDefaultUsers();
   }
 
   bool isLoaded = false;
@@ -34,64 +49,30 @@ class AppState extends ChangeNotifier {
   // Active Matrix Routing Paths (Destination ID -> Source ID)
   final Map<String, String?> activeRoutes = {};
 
-  // Saved routing configurations
-  final List<Map<String, dynamic>> savedSnapshots = [];
+  // Routing presets, stored on the controller so touch panels share them.
+  List<ControllerSnapshot> snapshots = [];
+  ControllerApiException? snapshotsError;
+  bool snapshotsLoading = false;
 
   // Global Notifiers for listeners
   final ValueNotifier<int> stateVersionNotifier = ValueNotifier<int>(0);
-  final ValueNotifier<int> tabIndexNotifier = ValueNotifier<int>(0);
+  // Id of the visible tab (one of AppTabs).
+  final ValueNotifier<String> currentTab = ValueNotifier<String>('');
 
   // Track the most recently adopted device to auto-focus in Configuration
   String? lastAdoptedDeviceId;
 
-  // Mock Firmware Repository
-  final List<Map<String, dynamic>> firmwareDownloads = [
-    {'version': 'v2.4.1', 'status': 'Available', 'size': '45MB'},
-    {'version': 'v2.3.9', 'status': 'Installed', 'size': '42MB'},
-  ];
-
-  String firmwareDeploymentStatus = 'Idle';
-
-  void initializeSampleData() {
-    if (users.isNotEmpty) return;
+  // Built-in login accounts; users aren't persisted yet.
+  void _seedDefaultUsers() {
     users.addAll([
       UserAccount(id: 'u1', username: 'admin', password: '123', role: 'Admin'),
-      UserAccount(id: 'u2', username: 'operator', password: '123', role: 'User'),
+      UserAccount(
+        id: 'u2',
+        username: 'operator',
+        password: '123',
+        role: 'User',
+      ),
     ]);
-
-    if (sources.isEmpty) {
-      sources.addAll([
-        Device(id: 'demo_tx_1', name: 'Main Camera', ip: '192.168.1.101', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[0], previewUrl: 'hdmi.png'),
-        Device(id: 'demo_tx_2', name: 'Presenter Laptop', ip: '192.168.1.102', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[1], previewUrl: 'hdmi.png'),
-        Device(id: 'demo_tx_3', name: 'Document Camera', ip: '192.168.1.103', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[2], previewUrl: 'hdmi.png'),
-        Device(id: 'demo_tx_4', name: 'Media Server', ip: '192.168.1.104', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[3], previewUrl: 'hdmi.png'),
-        Device(id: 'demo_tx_5', name: 'Remote Feed', ip: '192.168.1.105', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[4], previewUrl: 'hdmi.png'),
-        Device(id: 'demo_tx_6', name: 'Evidence Display', ip: '192.168.1.106', type: DeviceType.tx, status: DeviceStatus.online, location: 'Unassigned', tags: ['Demo'], videoUrl: _demoVideos[5], previewUrl: 'hdmi.png'),
-      ]);
-    }
-
-    if (destinationsByLocation.isEmpty) {
-      final demoDestinations = {
-        'Courtroom A': [
-          Device(id: 'demo_rx_1', name: 'Main Display', ip: '192.168.1.201', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom A', tags: ['Demo']),
-          Device(id: 'demo_rx_2', name: 'Side Display', ip: '192.168.1.202', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom A', tags: ['Demo']),
-        ],
-        'Courtroom B': [
-          Device(id: 'demo_rx_3', name: 'Main Display', ip: '192.168.1.203', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom B', tags: ['Demo']),
-          Device(id: 'demo_rx_4', name: 'Witness Screen', ip: '192.168.1.204', type: DeviceType.rx, status: DeviceStatus.online, location: 'Courtroom B', tags: ['Demo']),
-        ],
-        'Conference Room': [
-          Device(id: 'demo_rx_5', name: 'Projector', ip: '192.168.1.205', type: DeviceType.rx, status: DeviceStatus.online, location: 'Conference Room', tags: ['Demo']),
-          Device(id: 'demo_rx_6', name: 'Side Monitor', ip: '192.168.1.206', type: DeviceType.rx, status: DeviceStatus.online, location: 'Conference Room', tags: ['Demo']),
-        ],
-        'Lobby': [
-          Device(id: 'demo_rx_7', name: 'Reception Display', ip: '192.168.1.207', type: DeviceType.rx, status: DeviceStatus.online, location: 'Lobby', tags: ['Demo']),
-        ],
-      };
-      for (final entry in demoDestinations.entries) {
-        destinationsByLocation[entry.key] = entry.value;
-      }
-    }
   }
 
   // ── Database Load (called once on app start) ───────────────────────────────
@@ -120,10 +101,16 @@ class AppState extends ChangeNotifier {
     // Load active routes
     final routes = await db.loadActiveRoutes();
     activeRoutes.addAll(routes);
-
-    // Load snapshots
-    final snapshots = await db.loadSnapshots();
-    savedSnapshots.addAll(snapshots);
+    // Drop routes to devices that no longer exist, such as the old demo
+    // devices; notifyListeners() below saves the cleaned routes.
+    final knownIds = {
+      ...sources.map((d) => d.id),
+      ...destinationsByLocation.values.expand((d) => d).map((d) => d.id),
+    };
+    activeRoutes.removeWhere(
+      (dest, src) =>
+          !knownIds.contains(dest) || (src != null && !knownIds.contains(src)),
+    );
 
     isLoaded = true;
     notifyListeners();
@@ -144,49 +131,17 @@ class AppState extends ChangeNotifier {
     _persistRoutes();
   }
 
-  void clearAllRoutes() {
-    activeRoutes.clear();
-    notifyListeners();
-  }
-
-  void loadSnapshotRoutes(Map<String, String?> snapshotMapping) {
-    activeRoutes.clear();
-    activeRoutes.addAll(snapshotMapping);
-    notifyListeners();
-  }
-
-  void toggleWink(String deviceId) {
-    final device = [...sources, ...destinationsByLocation.values.expand((d) => d)]
-        .firstWhere((d) => d.id == deviceId);
-    device.isWinking = !device.isWinking;
-    notifyListeners();
-
-    if (device.isWinking) {
-      Future.delayed(const Duration(seconds: 10), () {
-        device.isWinking = false;
-        notifyListeners();
-      });
-    }
-  }
-
   // ── Device Adoption — saves to DB immediately ──────────────────────────────
 
-  static const _demoVideos = [
-    'assets/videos/demo_video_1.mp4',
-    'assets/videos/demo_video_2.mp4',
-    'assets/videos/demo_video_3.mp4',
-    'assets/videos/demo_video_4.mp4',
-    'assets/videos/demo_video_5.mp4',
-    'assets/videos/demo_video_6.mp4',
-  ];
-
-  Future<void> adoptDevice(String id, String name, String ip, DeviceType type) async {
-    // Assign a unique demo video per TX device (cycles through 6 available videos)
-    String? videoUrl;
-    if (type == DeviceType.tx) {
-      videoUrl = _demoVideos[sources.length % _demoVideos.length];
-    }
-
+  Future<void> adoptDevice(
+    String id,
+    String name,
+    String ip,
+    DeviceType type, {
+    String? previewUrl,
+    String? streamUrl,
+    String? channel,
+  }) async {
     final newDevice = Device(
       id: id,
       name: name,
@@ -195,8 +150,9 @@ class AppState extends ChangeNotifier {
       status: DeviceStatus.online,
       location: 'Unassigned',
       tags: ['Newly Adopted'],
-      previewUrl: type == DeviceType.tx ? 'hdmi.png' : 'monitor.png',
-      videoUrl: videoUrl,
+      previewUrl: previewUrl,
+      streamUrl: streamUrl,
+      channel: type == DeviceType.tx ? channel : null,
     );
 
     if (type == DeviceType.tx) {
@@ -216,6 +172,98 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── Controller device list ─────────────────────────────────────────────
+
+  /// Controller device id → name, from the last device list.
+  final Map<String, String> controllerDeviceNames = {};
+
+  DateTime? _lastDeviceRefresh;
+  Future<void>? _deviceRefresh;
+
+  /// Reloads the controller's device list and applies its preview/stream
+  /// URLs. Runs on screen open, periodically, and after any 404, because
+  /// device ids (and so the URLs) change when the controller restarts.
+  /// Skipped while a reload is running or within [minInterval] of the last
+  /// one, so many tiles hitting 404 at once cause a single reload.
+  Future<void> refreshDevices({
+    Duration minInterval = const Duration(seconds: 3),
+  }) {
+    if (!ApiConfig.isConfigured) return Future.value();
+    final running = _deviceRefresh;
+    if (running != null) return running;
+    final last = _lastDeviceRefresh;
+    if (last != null && DateTime.now().difference(last) < minInterval) {
+      return Future.value();
+    }
+    _lastDeviceRefresh = DateTime.now();
+    return _deviceRefresh = DeviceApiService.fetchDevices()
+        .then((found) {
+          if (found != null) applyControllerDevices(found);
+        })
+        .whenComplete(() => _deviceRefresh = null);
+  }
+
+  /// Copies online status and preview/stream URLs from a controller device
+  /// list onto the matching adopted devices (the adopted id is the MAC
+  /// without colons),
+  /// and takes each display's current source from the controller when it
+  /// reports one.
+  void applyControllerDevices(List<DiscoveredDevice> found) {
+    // Names of every box the controller knows, adopted or not, so snapshots
+    // can show them.
+    controllerDeviceNames
+      ..clear()
+      ..addAll({
+        for (final d in found)
+          if (d.controllerId != null) d.controllerId!: d.name,
+      });
+    final byId = {for (final d in found) d.mac.replaceAll(':', ''): d};
+    var changed = false;
+    for (final device in [
+      ...sources,
+      ...destinationsByLocation.values.expand((d) => d),
+    ]) {
+      final match = byId[device.id];
+      if (match == null) continue;
+      if (device.controllerId != match.controllerId) {
+        device.controllerId = match.controllerId;
+        changed = true;
+      }
+      final status =
+          match.signal > 0 ? DeviceStatus.online : DeviceStatus.offline;
+      if (device.status != status) {
+        device.status = status;
+        changed = true;
+      }
+      if (device.previewUrl != match.previewUrl ||
+          device.streamUrl != match.streamUrl) {
+        device.previewUrl = match.previewUrl;
+        device.streamUrl = match.streamUrl;
+        changed = true;
+      }
+      if (device.type == DeviceType.tx && device.channel != match.channel) {
+        device.channel = match.channel;
+        changed = true;
+      }
+      if (device.type != DeviceType.tx &&
+          device.currentTxIp != match.currentTxIp) {
+        device.currentTxIp = match.currentTxIp;
+        changed = true;
+      }
+      // A null current_tx_ip means the controller doesn't know, so the
+      // route set from this app stays.
+      final txIp = match.currentTxIp;
+      if (device.type != DeviceType.tx && txIp != null) {
+        final source = sources.where((s) => s.ip == txIp).firstOrNull;
+        if (source != null && activeRoutes[device.id] != source.id) {
+          activeRoutes[device.id] = source.id;
+          changed = true;
+        }
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
   // ── Device Removal — deletes from DB immediately ───────────────────────────
 
   Future<void> removeDevice(String deviceId, String location) async {
@@ -224,37 +272,74 @@ class AppState extends ChangeNotifier {
     if (destinationsByLocation[location]?.isEmpty ?? false) {
       destinationsByLocation.remove(location);
     }
+    // Forget routes to or from it; notifyListeners() saves the change.
+    activeRoutes.remove(deviceId);
+    activeRoutes.removeWhere((_, sourceId) => sourceId == deviceId);
     await DatabaseService.instance.deleteAdoptedDevice(deviceId);
     notifyListeners();
   }
 
-  // ── Snapshots — saves to DB immediately ───────────────────────────────────
+  // ── Snapshots — stored on the controller ──────────────────────────────────
 
-  Future<void> addSnapshot(Map<String, dynamic> snapshot) async {
-    await DatabaseService.instance.saveSnapshot(snapshot);
-    // Reload from DB to get the real auto-incremented id
-    final snapshots = await DatabaseService.instance.loadSnapshots();
-    savedSnapshots
-      ..clear()
-      ..addAll(snapshots);
+  // Rebuilds listeners without re-saving routes.
+  void _refreshListeners() {
     stateVersionNotifier.value++;
     super.notifyListeners();
   }
 
-  Future<void> deleteSnapshot(int index) async {
-    final snap = savedSnapshots[index];
-    final snapId = snap['id'];
-    if (snapId != null) {
-      await DatabaseService.instance.deleteSnapshot(snapId as int);
+  /// Reloads the controller's snapshots. Failures land in [snapshotsError].
+  Future<void> loadSnapshots() async {
+    if (!ApiConfig.isConfigured) return;
+    snapshotsLoading = true;
+    _refreshListeners();
+    try {
+      snapshots = await SnapshotService.list();
+      snapshotsError = null;
+    } on ControllerApiException catch (e) {
+      snapshotsError = e;
+    } finally {
+      snapshotsLoading = false;
+      _refreshListeners();
     }
-    savedSnapshots.removeAt(index);
-    stateVersionNotifier.value++;
-    super.notifyListeners();
   }
 
-  Future<bool> updateStreamSelection(String deviceId, String streamId) async {
-    debugPrint('API CALL: updateStreamSelection(device: $deviceId, stream: $streamId)');
-    await Future.delayed(const Duration(milliseconds: 500));
-    return true;
+  /// What [displays] show right now, as controller ids. Displays without a
+  /// source, or not yet matched to the controller's list, are left out.
+  List<SnapshotRoute> currentSnapshotRoutes(Iterable<Device> displays) {
+    final sourcesById = {for (final s in sources) s.id: s};
+    return [
+      for (final display in displays)
+        if (display.controllerId != null &&
+            sourcesById[activeRoutes[display.id]]?.controllerId != null)
+          SnapshotRoute(
+            rxId: display.controllerId!,
+            txId: sourcesById[activeRoutes[display.id]]!.controllerId!,
+          ),
+    ];
+  }
+
+  /// These throw [ControllerApiException] with a message to show the user.
+  Future<void> createSnapshot({
+    required String name,
+    required String scope,
+    required List<SnapshotRoute> routes,
+  }) async {
+    await SnapshotService.create(name: name, scope: scope, routes: routes);
+    await loadSnapshots();
+  }
+
+  Future<void> updateSnapshot(
+    String id, {
+    required String name,
+    required String scope,
+    required List<SnapshotRoute> routes,
+  }) async {
+    await SnapshotService.update(id, name: name, scope: scope, routes: routes);
+    await loadSnapshots();
+  }
+
+  Future<void> deleteSnapshot(String id) async {
+    await SnapshotService.delete(id);
+    await loadSnapshots();
   }
 }

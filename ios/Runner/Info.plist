@@ -29,7 +29,10 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_http._tcp</string>
+		<string>_authenticav._tcp</string>
 	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Authentic AV uses Bluetooth once to send your Wi-Fi details to the SC-1 controller.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Authentic AV needs local network access to discover and control AV-over-IP devices on your network.</string>
 	<key>UIApplicationSceneManifest</key>

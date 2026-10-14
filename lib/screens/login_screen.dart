@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import 'server_setup_screen.dart';
 import '../logic/app_state.dart';
+import '../config/session.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -14,6 +15,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _usernameCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   bool _isLoading = false;
+  bool _rememberMe = false;
 
   void _executeLogin() async {
     final u = _usernameCtrl.text.trim();
@@ -25,15 +27,18 @@ class _LoginScreenState extends State<LoginScreen> {
     }
 
     setState(() => _isLoading = true);
-    
-    // Simulate brief network handshake
-    await Future.delayed(const Duration(milliseconds: 600));
 
     // Evaluate credentials against the active RBAC engine
     try {
       final matchedUser = AppState.instance.users.firstWhere(
         (user) => user.username == u && user.password == p,
       );
+
+      if (_rememberMe) {
+        await Session.remember(matchedUser.username);
+      } else {
+        await Session.forget();
+      }
 
       // Launch application with retrieved security privileges
       if (mounted) {
@@ -133,7 +138,26 @@ class _LoginScreenState extends State<LoginScreen> {
                               border: InputBorder.none,
                             ),
                           ),
-                          const SizedBox(height: 32),
+                          const SizedBox(height: 12),
+                          GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () => setState(() => _rememberMe = !_rememberMe),
+                            child: Row(
+                              children: [
+                                Checkbox(
+                                  value: _rememberMe,
+                                  onChanged: (v) => setState(() => _rememberMe = v ?? false),
+                                  activeColor: AppTheme.accentWhite,
+                                  checkColor: Colors.black,
+                                  side: const BorderSide(color: Colors.white54),
+                                ),
+                                const Flexible(
+                                  child: Text('Remember me', style: TextStyle(color: Colors.white70, fontSize: 14)),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
                           SizedBox(
                             width: double.infinity,
                             height: 50,

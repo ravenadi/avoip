@@ -58,26 +58,6 @@ class DatabaseService {
     ''');
 
     await db.execute('''
-      CREATE TABLE snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        date TEXT NOT NULL,
-        routes INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
-      )
-    ''');
-
-    await db.execute('''
-      CREATE TABLE snapshot_routes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        snapshot_id INTEGER NOT NULL,
-        destination_id TEXT NOT NULL,
-        source_id TEXT,
-        FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
-      )
-    ''');
-
-    await db.execute('''
       CREATE TABLE settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -87,10 +67,12 @@ class DatabaseService {
 
   // ── Discovered Devices ────────────────────────────────────────────────────
 
+  /// Replaces the saved scan with [devices].
   Future<void> saveDiscoveredDevices(List<Map<String, dynamic>> devices) async {
     final db = await database;
     final batch = db.batch();
     final now = DateTime.now().millisecondsSinceEpoch;
+    batch.delete('discovered_devices');
 
     for (final d in devices) {
       batch.insert(
@@ -120,8 +102,6 @@ class DatabaseService {
         'type': device.type.name,
         'status': device.status.name,
         'location': device.location,
-        'preview_url': device.previewUrl,
-        'video_url': device.videoUrl,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
@@ -142,8 +122,6 @@ class DatabaseService {
       type: DeviceType.values.firstWhere((e) => e.name == row['type'], orElse: () => DeviceType.rx),
       status: DeviceStatus.values.firstWhere((e) => e.name == row['status'], orElse: () => DeviceStatus.online),
       location: row['location'] as String? ?? 'Unassigned',
-      previewUrl: row['preview_url'] as String?,
-      videoUrl: row['video_url'] as String?,
     )).toList();
   }
 
@@ -168,61 +146,6 @@ class DatabaseService {
     return {for (final r in rows) r['destination_id'] as String: r['source_id'] as String?};
   }
 
-  // ── Snapshots ─────────────────────────────────────────────────────────────
-
-  Future<void> saveSnapshot(Map<String, dynamic> snapshot) async {
-    final db = await database;
-    final matrix = snapshot['matrix'] as Map<String, String?>;
-
-    final snapshotId = await db.insert('snapshots', {
-      'title': snapshot['title'],
-      'date': snapshot['date'],
-      'routes': snapshot['routes'],
-      'created_at': DateTime.now().millisecondsSinceEpoch,
-    });
-
-    final batch = db.batch();
-    for (final entry in matrix.entries) {
-      batch.insert('snapshot_routes', {
-        'snapshot_id': snapshotId,
-        'destination_id': entry.key,
-        'source_id': entry.value,
-      });
-    }
-    await batch.commit(noResult: true);
-  }
-
-  Future<void> deleteSnapshot(int snapshotId) async {
-    final db = await database;
-    await db.delete('snapshots', where: 'id = ?', whereArgs: [snapshotId]);
-    await db.delete('snapshot_routes', where: 'snapshot_id = ?', whereArgs: [snapshotId]);
-  }
-
-  Future<List<Map<String, dynamic>>> loadSnapshots() async {
-    final db = await database;
-    final snapshots = await db.query('snapshots', orderBy: 'created_at DESC');
-    final result = <Map<String, dynamic>>[];
-
-    for (final snap in snapshots) {
-      final routes = await db.query(
-        'snapshot_routes',
-        where: 'snapshot_id = ?',
-        whereArgs: [snap['id']],
-      );
-      final matrix = <String, String?>{
-        for (final r in routes) r['destination_id'] as String: r['source_id'] as String?
-      };
-      result.add({
-        'id': snap['id'],
-        'title': snap['title'],
-        'date': snap['date'],
-        'routes': snap['routes'],
-        'matrix': matrix,
-      });
-    }
-    return result;
-  }
-
   // ── Settings ──────────────────────────────────────────────────────────────
 
   Future<void> saveSetting(String key, String value) async {
@@ -232,6 +155,11 @@ class DatabaseService {
       {'key': key, 'value': value},
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  Future<void> deleteSetting(String key) async {
+    final db = await database;
+    await db.delete('settings', where: 'key = ?', whereArgs: [key]);
   }
 
   Future<String?> loadSetting(String key) async {

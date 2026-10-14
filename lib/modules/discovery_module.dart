@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'dart:math';
 import '../theme/app_theme.dart';
@@ -5,24 +6,39 @@ import '../logic/app_state.dart';
 import '../models/device_model.dart';
 import '../services/device_api_service.dart';
 import '../services/database_service.dart';
+import '../config/api_config.dart';
 
 // Using global DeviceType from models/device_model.dart
 enum AdoptStatus { pending, adopting, adopted }
 
 class DiscoveredDevice {
+  // The controller's id for this box (stable, derived from its MAC).
+  final String? controllerId;
   final String name;
   final String ip;
   final String mac;
   final int signal;
   final DeviceType type;
+  // Controller `preview_url` / `stream_url` for this device.
+  final String? previewUrl;
+  final String? streamUrl;
+  // IP of the TX this RX shows, when the controller knows it.
+  final String? currentTxIp;
+  // Controller-managed TX channel; null until the controller has read it.
+  final String? channel;
   AdoptStatus status;
 
   DiscoveredDevice({
+    this.controllerId,
     required this.name,
     required this.ip,
     required this.mac,
     required this.signal,
     required this.type,
+    this.previewUrl,
+    this.streamUrl,
+    this.currentTxIp,
+    this.channel,
     this.status = AdoptStatus.pending,
   });
 }
@@ -42,21 +58,69 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
   late Animation<double> _pulseAnim;
 
   final List<DiscoveredDevice> _devices = [];
+  // The list on screen came from the phone's last saved scan.
+  bool _showingSavedScan = false;
+  // Set when the controller couldn't be reached.
+  String? _controllerError;
 
   List<DiscoveredDevice> get _filteredDevices {
-    if (_filterType == 'RX') return _devices.where((d) => d.type == DeviceType.rx).toList();
-    if (_filterType == 'TX') return _devices.where((d) => d.type == DeviceType.tx).toList();
-    if (_filterType == 'CX') return _devices.where((d) => d.type == DeviceType.cx).toList();
+    if (_filterType == 'RX') {
+      return _devices.where((d) => d.type == DeviceType.rx).toList();
+    }
+    if (_filterType == 'TX') {
+      return _devices.where((d) => d.type == DeviceType.tx).toList();
+    }
+    if (_filterType == 'CX') {
+      return _devices.where((d) => d.type == DeviceType.cx).toList();
+    }
     return _devices;
   }
 
   @override
   void initState() {
     super.initState();
-    _pulseCtrl = AnimationController(vsync: this, duration: const Duration(seconds: 2))
-      ..repeat(reverse: true);
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
     _pulseAnim = CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut);
-    _loadFromDatabase();
+    // Show the last scan right away, then replace it with the live list.
+    _loadFromDatabase().then((_) => _refreshList());
+    AppState.instance.currentTab.addListener(_onTabChanged);
+  }
+
+  void _onTabChanged() {
+    if (AppState.instance.currentTab.value == AppTabs.discovery) _refreshList();
+  }
+
+  // Quietly replaces the list with the controller's current one.
+  Future<void> _refreshList() async {
+    if (_isScanning || !ApiConfig.isConfigured) return;
+    if (_devices.any((d) => d.status == AdoptStatus.adopting)) return;
+    final found = await DeviceApiService.fetchDevices();
+    if (!mounted || _isScanning) return;
+    _applyFound(found);
+  }
+
+  void _applyFound(List<DiscoveredDevice>? found) {
+    if (found == null) {
+      setState(
+        () =>
+            _controllerError =
+                "Couldn't reach the controller at ${ApiConfig.ip}.",
+      );
+      return;
+    }
+    AppState.instance.applyControllerDevices(found);
+    setState(() {
+      _devices
+        ..clear()
+        ..addAll(found);
+      _restoreAdoptedStatus();
+      _showingSavedScan = false;
+      _controllerError = null;
+    });
+    _saveToDatabase(found);
   }
 
   // ── Load last scan results from DB on app open ─────────────────────────────
@@ -67,26 +131,34 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
     // Build set of already-adopted device IDs (mac-based)
     final adoptedIds = {
       ...AppState.instance.sources.map((d) => d.id),
-      ...AppState.instance.destinationsByLocation.values.expand((d) => d).map((d) => d.id),
+      ...AppState.instance.destinationsByLocation.values
+          .expand((d) => d)
+          .map((d) => d.id),
     };
 
     setState(() {
+      _showingSavedScan = true;
       for (final row in rows) {
         final ip = row['ip'] as String;
         if (_devices.any((d) => d.ip == ip)) continue;
         final mac = row['mac'] as String;
         final deviceId = mac.replaceAll(':', '');
-        _devices.add(DiscoveredDevice(
-          name: row['name'] as String,
-          ip: ip,
-          mac: mac,
-          signal: (row['signal'] as int?) ?? 100,
-          type: DeviceType.values.firstWhere(
-            (e) => e.name == (row['type'] as String),
-            orElse: () => DeviceType.rx,
+        _devices.add(
+          DiscoveredDevice(
+            name: row['name'] as String,
+            ip: ip,
+            mac: mac,
+            signal: (row['signal'] as int?) ?? 100,
+            type: DeviceType.values.firstWhere(
+              (e) => e.name == (row['type'] as String),
+              orElse: () => DeviceType.rx,
+            ),
+            status:
+                adoptedIds.contains(deviceId)
+                    ? AdoptStatus.adopted
+                    : AdoptStatus.pending,
           ),
-          status: adoptedIds.contains(deviceId) ? AdoptStatus.adopted : AdoptStatus.pending,
-        ));
+        );
       }
     });
   }
@@ -95,7 +167,9 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
   void _restoreAdoptedStatus() {
     final adoptedIds = {
       ...AppState.instance.sources.map((d) => d.id),
-      ...AppState.instance.destinationsByLocation.values.expand((d) => d).map((d) => d.id),
+      ...AppState.instance.destinationsByLocation.values
+          .expand((d) => d)
+          .map((d) => d.id),
     };
     for (final device in _devices) {
       final deviceId = device.mac.replaceAll(':', '');
@@ -107,18 +181,24 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
 
   // ── Save scan results to DB after every scan ───────────────────────────────
   Future<void> _saveToDatabase(List<DiscoveredDevice> devices) async {
-    final maps = devices.map((d) => {
-      'name': d.name,
-      'ip': d.ip,
-      'mac': d.mac,
-      'signal': d.signal,
-      'type': d.type.name,
-    }).toList();
+    final maps =
+        devices
+            .map(
+              (d) => {
+                'name': d.name,
+                'ip': d.ip,
+                'mac': d.mac,
+                'signal': d.signal,
+                'type': d.type.name,
+              },
+            )
+            .toList();
     await DatabaseService.instance.saveDiscoveredDevices(maps);
   }
 
   @override
   void dispose() {
+    AppState.instance.currentTab.removeListener(_onTabChanged);
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -126,136 +206,218 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
   void _startScan() async {
     setState(() {
       _isScanning = true;
-      _scanStatus = 'Detecting network...';
-      _devices.clear();
+      _scanStatus = 'Scanning the network...';
     });
 
+    // Ask the controller to look for new boxes, then list all it knows.
+    // The list still loads if the scan request itself fails.
+    final scanError = await DeviceApiService.triggerScan();
+    if (!mounted) return;
+    setState(() => _scanStatus = 'Loading devices...');
     final found = await DeviceApiService.fetchDevices(
       onStatus: (status) {
         if (mounted) setState(() => _scanStatus = status);
       },
     );
-
     if (!mounted) return;
 
     final previousCount = _devices.length;
     setState(() {
       _isScanning = false;
       _scanStatus = '';
-      for (final device in found) {
-        if (!_devices.any((d) => d.ip == device.ip)) {
-          _devices.add(device);
-        }
-      }
-      _restoreAdoptedStatus();
     });
-
-    if (found.isNotEmpty) await _saveToDatabase(found);
-    if (mounted) _showScanResultPopup(found, previousCount);
+    _applyFound(found);
+    if (scanError != null && found != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Network scan failed ($scanError). Showing the devices the '
+            'controller already knows.',
+          ),
+          backgroundColor: Colors.orangeAccent,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+    if (found != null) _showScanResultPopup(found, previousCount);
   }
 
   void _showScanResultPopup(List<DiscoveredDevice> found, int previousCount) {
-    final newDevices = found.where((d) {
-      final id = d.mac.replaceAll(':', '');
-      final adoptedIds = {
-        ...AppState.instance.sources.map((s) => s.id),
-        ...AppState.instance.destinationsByLocation.values.expand((l) => l).map((s) => s.id),
-      };
-      return !adoptedIds.contains(id);
-    }).toList();
+    final newDevices =
+        found.where((d) {
+          final id = d.mac.replaceAll(':', '');
+          final adoptedIds = {
+            ...AppState.instance.sources.map((s) => s.id),
+            ...AppState.instance.destinationsByLocation.values
+                .expand((l) => l)
+                .map((s) => s.id),
+          };
+          return !adoptedIds.contains(id);
+        }).toList();
 
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        padding: const EdgeInsets.all(24),
-        decoration: const BoxDecoration(
-          color: Color(0xFF1A1A1A),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
-            const SizedBox(height: 20),
-            // Result icon
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: found.isEmpty ? Colors.orange.withValues(alpha: 0.1) : Colors.greenAccent.withValues(alpha: 0.1),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                found.isEmpty ? Icons.wifi_off_rounded : Icons.radar_rounded,
-                color: found.isEmpty ? Colors.orangeAccent : Colors.greenAccent,
-                size: 32,
-              ),
+      builder:
+          (ctx) => Container(
+            padding: const EdgeInsets.all(24),
+            decoration: const BoxDecoration(
+              color: Color(0xFF1A1A1A),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
             ),
-            const SizedBox(height: 16),
-            Text(
-              found.isEmpty ? 'No Devices Found' : 'Scan Complete',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
-            ),
-            const SizedBox(height: 8),
-            if (found.isEmpty)
-              Text(
-                'Make sure your phone is on the\nsame WiFi as your AV devices.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
-              )
-            else ...[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  _resultChip('${found.length} Total', Colors.blue),
-                  const SizedBox(width: 8),
-                  _resultChip('${newDevices.length} New', Colors.greenAccent),
-                  const SizedBox(width: 8),
-                  _resultChip('${found.length - newDevices.length} Adopted', Colors.purple),
-                ],
-              ),
-              if (newDevices.isNotEmpty) ...[
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                // Result icon
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color:
+                        found.isEmpty
+                            ? Colors.orange.withValues(alpha: 0.1)
+                            : Colors.greenAccent.withValues(alpha: 0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    found.isEmpty
+                        ? Icons.wifi_off_rounded
+                        : Icons.radar_rounded,
+                    color:
+                        found.isEmpty
+                            ? Colors.orangeAccent
+                            : Colors.greenAccent,
+                    size: 32,
+                  ),
+                ),
                 const SizedBox(height: 16),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text('New Devices Found', style: TextStyle(color: Colors.grey.shade400, fontSize: 12, fontWeight: FontWeight.bold)),
+                Text(
+                  found.isEmpty ? 'No Devices Found' : 'Scan Complete',
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
                 ),
                 const SizedBox(height: 8),
-                ...newDevices.take(3).map((d) => Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
-                  child: Row(
+                if (found.isEmpty)
+                  Text(
+                    'The controller found no AV devices.\nCheck the boxes are powered and on the network.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                  )
+                else ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(d.type == DeviceType.tx ? Icons.cast_rounded : Icons.monitor_rounded,
-                          size: 16, color: d.type == DeviceType.tx ? Colors.purpleAccent : Colors.blueAccent),
-                      const SizedBox(width: 10),
-                      Text(d.name, style: const TextStyle(color: Colors.white, fontSize: 13)),
-                      const Spacer(),
-                      Text(d.ip, style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                      _resultChip('${found.length} Total', Colors.blue),
+                      const SizedBox(width: 8),
+                      _resultChip(
+                        '${newDevices.length} New',
+                        Colors.greenAccent,
+                      ),
+                      const SizedBox(width: 8),
+                      _resultChip(
+                        '${found.length - newDevices.length} Adopted',
+                        Colors.purple,
+                      ),
                     ],
                   ),
-                )),
-                if (newDevices.length > 3)
-                  Text('+${newDevices.length - 3} more', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
-              ],
-            ],
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () => Navigator.pop(ctx),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.greenAccent,
-                  foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  if (newDevices.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'New Devices Found',
+                        style: TextStyle(
+                          color: Colors.grey.shade400,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    ...newDevices
+                        .take(3)
+                        .map(
+                          (d) => Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  d.type == DeviceType.tx
+                                      ? Icons.cast_rounded
+                                      : Icons.monitor_rounded,
+                                  size: 16,
+                                  color:
+                                      d.type == DeviceType.tx
+                                          ? Colors.purpleAccent
+                                          : Colors.blueAccent,
+                                ),
+                                const SizedBox(width: 10),
+                                Text(
+                                  d.name,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  d.ip,
+                                  style: TextStyle(
+                                    color: Colors.grey.shade500,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    if (newDevices.length > 3)
+                      Text(
+                        '+${newDevices.length - 3} more',
+                        style: TextStyle(
+                          color: Colors.grey.shade600,
+                          fontSize: 12,
+                        ),
+                      ),
+                  ],
+                ],
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.greenAccent,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text(
+                      'Got it',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                  ),
                 ),
-                child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-              ),
+                const SizedBox(height: 8),
+              ],
             ),
-            const SizedBox(height: 8),
-          ],
-        ),
-      ),
+          ),
     );
   }
 
@@ -267,82 +429,138 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
-      child: Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.bold)),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
     );
   }
 
-  Future<void> _adoptDevice(DiscoveredDevice dev) async {
-    setState(() => dev.status = AdoptStatus.adopting);
-    
-    // Simulate adoption handshake delay
-    await Future.delayed(const Duration(seconds: 1));
-    
-    if (mounted) {
-      // Execute the registry adoption in AppState
+  List<DiscoveredDevice> get _pendingDevices =>
+      _devices.where((d) => d.status == AdoptStatus.pending).toList();
+
+  // Adopts all pending devices without opening Configuration for each one.
+  Future<void> _adoptAll() async {
+    final pending = _pendingDevices;
+    setState(() {
+      for (final dev in pending) {
+        dev.status = AdoptStatus.adopting;
+      }
+    });
+
+    for (final dev in pending) {
       await AppState.instance.adoptDevice(
         dev.mac.replaceAll(':', ''),
         dev.name,
         dev.ip,
         dev.type,
+        previewUrl: dev.previewUrl,
+        streamUrl: dev.streamUrl,
+        channel: dev.channel,
       );
-
-      setState(() => dev.status = AdoptStatus.adopted);
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('${dev.name} Adopted! Opening Hardware Config...'),
-          backgroundColor: Colors.greenAccent,
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-
-      // Wait for snackbar to be seen
-      await Future.delayed(const Duration(milliseconds: 800));
-      
-      if (mounted) {
-        // Tab index 3 is Configuration
-        AppState.instance.tabIndexNotifier.value = 3;
-      }
     }
+    AppState.instance.lastAdoptedDeviceId = null;
+    // Devices listed from the last saved scan carry no URLs yet.
+    if (pending.any((d) => d.previewUrl == null)) {
+      unawaited(AppState.instance.refreshDevices(minInterval: Duration.zero));
+    }
+    if (!mounted) return;
+
+    setState(() {
+      for (final dev in pending) {
+        dev.status = AdoptStatus.adopted;
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          '${pending.length} device${pending.length == 1 ? '' : 's'} adopted',
+        ),
+        backgroundColor: Colors.greenAccent,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
-  Color _signalColor(int signal) {
-    if (signal >= 75) return Colors.greenAccent;
-    if (signal >= 45) return Colors.orangeAccent;
-    return Colors.redAccent;
+  Future<void> _adoptDevice(DiscoveredDevice dev) async {
+    setState(() => dev.status = AdoptStatus.adopting);
+
+    // Execute the registry adoption in AppState
+    await AppState.instance.adoptDevice(
+      dev.mac.replaceAll(':', ''),
+      dev.name,
+      dev.ip,
+      dev.type,
+      previewUrl: dev.previewUrl,
+      streamUrl: dev.streamUrl,
+      channel: dev.channel,
+    );
+    // Devices listed from the last saved scan carry no URLs yet.
+    if (dev.previewUrl == null) {
+      unawaited(AppState.instance.refreshDevices(minInterval: Duration.zero));
+    }
+    if (!mounted) return;
+
+    setState(() => dev.status = AdoptStatus.adopted);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('${dev.name} Adopted! Opening Hardware Config...'),
+        backgroundColor: Colors.greenAccent,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+
+    // Wait for snackbar to be seen
+    await Future.delayed(const Duration(milliseconds: 800));
+
+    if (mounted) {
+      AppState.instance.currentTab.value = AppTabs.configuration;
+    }
   }
 
   IconData _typeIcon(DeviceType type) {
     switch (type) {
-      case DeviceType.rx: return Icons.monitor_rounded;
-      case DeviceType.tx: return Icons.cast_rounded;
-      case DeviceType.cx: return Icons.hub_rounded;
-      default: return Icons.device_unknown_rounded;
+      case DeviceType.rx:
+        return Icons.monitor_rounded;
+      case DeviceType.tx:
+        return Icons.cast_rounded;
+      case DeviceType.cx:
+        return Icons.hub_rounded;
     }
   }
 
   String _typeLabel(DeviceType type) {
     switch (type) {
-      case DeviceType.rx: return 'RX';
-      case DeviceType.tx: return 'TX';
-      case DeviceType.cx: return 'CX';
-      default: return '?';
+      case DeviceType.rx:
+        return 'RX';
+      case DeviceType.tx:
+        return 'TX';
+      case DeviceType.cx:
+        return 'CX';
     }
   }
 
   Color _typeColor(DeviceType type) {
     switch (type) {
-      case DeviceType.rx: return Colors.blueAccent;
-      case DeviceType.tx: return Colors.purpleAccent;
-      case DeviceType.cx: return Colors.orangeAccent;
-      default: return Colors.grey;
+      case DeviceType.rx:
+        return Colors.blueAccent;
+      case DeviceType.tx:
+        return Colors.purpleAccent;
+      case DeviceType.cx:
+        return Colors.orangeAccent;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final total = _devices.length;
-    final adopted = _devices.where((d) => d.status == AdoptStatus.adopted).length;
+    final adopted =
+        _devices.where((d) => d.status == AdoptStatus.adopted).length;
     final pending = total - adopted;
 
     return SingleChildScrollView(
@@ -351,24 +569,26 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // ── Header ──────────────────────────────────────────────────────────
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Device Discovery',
-                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppTheme.textMain)),
-                    const SizedBox(height: 4),
-                    Text('Scan the network for AVoIP hardware',
-                        style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
-                  ],
-                ),
+          const FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Discovery',
+              maxLines: 1,
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                color: AppTheme.textMain,
               ),
-              _buildScanButton(),
-            ],
+            ),
           ),
+          const SizedBox(height: 4),
+          Text(
+            'Scan the network for AVoIP hardware',
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(width: double.infinity, child: _buildScanButton()),
           const SizedBox(height: 16),
 
           // ── WiFi Notice Banner ───────────────────────────────────────────────
@@ -377,7 +597,9 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
             decoration: BoxDecoration(
               color: Colors.blueAccent.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.3)),
+              border: Border.all(
+                color: Colors.blueAccent.withValues(alpha: 0.3),
+              ),
             ),
             child: Row(
               children: [
@@ -387,7 +609,11 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                     color: Colors.blueAccent.withValues(alpha: 0.15),
                     shape: BoxShape.circle,
                   ),
-                  child: const Icon(Icons.wifi_rounded, color: Colors.blueAccent, size: 18),
+                  child: const Icon(
+                    Icons.wifi_rounded,
+                    color: Colors.blueAccent,
+                    size: 18,
+                  ),
                 ),
                 const SizedBox(width: 12),
                 const Expanded(
@@ -395,7 +621,7 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Connect to the AV System WiFi',
+                        'Connect your phone to Wi-Fi',
                         style: TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
@@ -404,8 +630,12 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                       ),
                       SizedBox(height: 3),
                       Text(
-                        'Make sure your phone is connected to the same WiFi network as the Netgear box before scanning.',
-                        style: TextStyle(color: Color(0xFF9E9E9E), fontSize: 11, height: 1.4),
+                        'Make sure this phone is on the same Wi-Fi as your SC-1 controller.',
+                        style: TextStyle(
+                          color: Color(0xFF9E9E9E),
+                          fontSize: 11,
+                          height: 1.4,
+                        ),
                       ),
                     ],
                   ),
@@ -418,66 +648,130 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
           // ── Stats Row ───────────────────────────────────────────────────────
           Row(
             children: [
-              _statTile(Icons.devices_rounded, total.toString(), 'Found', Colors.blue.shade300),
+              _statTile(
+                Icons.devices_rounded,
+                total.toString(),
+                'Found',
+                Colors.blue.shade300,
+              ),
               const SizedBox(width: 10),
-              _statTile(Icons.check_circle_rounded, adopted.toString(), 'Adopted', Colors.greenAccent),
+              _statTile(
+                Icons.check_circle_rounded,
+                adopted.toString(),
+                'Adopted',
+                Colors.greenAccent,
+              ),
               const SizedBox(width: 10),
-              _statTile(Icons.pending_rounded, pending.toString(), 'Pending', Colors.orangeAccent),
+              _statTile(
+                Icons.pending_rounded,
+                pending.toString(),
+                'Pending',
+                Colors.orangeAccent,
+              ),
             ],
           ),
           const SizedBox(height: 20),
 
-          // ── Radar Animation + Progress (when scanning) ──────────────────────
-          if (_isScanning) _buildRadar(),
-          if (_isScanning) const SizedBox(height: 12),
-          if (_isScanning) Column(
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: LinearProgressIndicator(
-                  value: null, // indeterminate — scanning all IPs at once
-                  minHeight: 4,
-                  backgroundColor: Colors.grey.shade800,
-                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.greenAccent),
+          // ── Adopt every pending device in one go ────────────────────────────
+          if (!_isScanning && _pendingDevices.isNotEmpty) ...[
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _adoptAll,
+                icon: const Icon(Icons.done_all_rounded, size: 18),
+                label: Text('Adopt all (${_pendingDevices.length})'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.greenAccent,
+                  side: const BorderSide(color: Colors.greenAccent),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
               ),
-              const SizedBox(height: 6),
-              Text(
-                _scanStatus.isEmpty ? 'Scanning network...' : _scanStatus,
-                style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
-              ),
-            ],
-          ),
+            ),
+            const SizedBox(height: 20),
+          ],
+
+          // ── Radar Animation + Progress (when scanning) ──────────────────────
+          if (!_isScanning && (_controllerError != null || _showingSavedScan))
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: _buildListNote(),
+            ),
+          if (_isScanning) _buildRadar(),
+          if (_isScanning) const SizedBox(height: 12),
+          if (_isScanning)
+            Column(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: null, // indeterminate — scanning all IPs at once
+                    minHeight: 4,
+                    backgroundColor: Colors.grey.shade800,
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                      Colors.greenAccent,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  _scanStatus.isEmpty ? 'Scanning network...' : _scanStatus,
+                  style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
+                ),
+              ],
+            ),
           if (_isScanning) const SizedBox(height: 20),
 
           // ── Filter Chips ─────────────────────────────────────────────────────
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
-              children: ['All', 'RX', 'TX', 'CX'].map((f) {
-                final selected = _filterType == f;
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: GestureDetector(
-                    onTap: () => setState(() => _filterType = f),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: selected ? Colors.greenAccent : Colors.grey.shade900,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: selected ? Colors.greenAccent : Colors.grey.shade800),
+              children:
+                  ['All', 'RX', 'TX', 'CX'].map((f) {
+                    final selected = _filterType == f;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: GestureDetector(
+                        onTap: () => setState(() => _filterType = f),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color:
+                                selected
+                                    ? Colors.greenAccent
+                                    : Colors.grey.shade900,
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color:
+                                  selected
+                                      ? Colors.greenAccent
+                                      : Colors.grey.shade800,
+                            ),
+                          ),
+                          child: Text(
+                            f,
+                            style: TextStyle(
+                              color:
+                                  selected
+                                      ? Colors.black
+                                      : Colors.grey.shade400,
+                              fontSize: 12,
+                              fontWeight:
+                                  selected
+                                      ? FontWeight.bold
+                                      : FontWeight.normal,
+                            ),
+                          ),
+                        ),
                       ),
-                      child: Text(f,
-                          style: TextStyle(
-                            color: selected ? Colors.black : Colors.grey.shade400,
-                            fontSize: 12,
-                            fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                          )),
-                    ),
-                  ),
-                );
-              }).toList(),
+                    );
+                  }).toList(),
             ),
           ),
           const SizedBox(height: 16),
@@ -495,31 +789,61 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                         color: Colors.grey.shade900,
                         shape: BoxShape.circle,
                       ),
-                      child: Icon(Icons.wifi_find_rounded, size: 40, color: Colors.grey.shade600),
+                      child: Icon(
+                        Icons.wifi_find_rounded,
+                        size: 40,
+                        color: Colors.grey.shade600,
+                      ),
                     ),
                     const SizedBox(height: 16),
-                    Text('No Devices Found',
-                        style: TextStyle(color: Colors.grey.shade400, fontSize: 16, fontWeight: FontWeight.bold)),
+                    Text(
+                      'No Devices Found',
+                      style: TextStyle(
+                        color: Colors.grey.shade400,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: 6),
-                    Text('Make sure your phone is on the\nsame WiFi as your AV devices.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                    Text(
+                      'Make sure your phone is on the\nsame WiFi as your AV devices.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.grey.shade600,
+                        fontSize: 13,
+                      ),
+                    ),
                     const SizedBox(height: 20),
                     GestureDetector(
                       onTap: _startScan,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 12,
+                        ),
                         decoration: BoxDecoration(
                           color: Colors.greenAccent.withValues(alpha: 0.1),
                           borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.4)),
+                          border: Border.all(
+                            color: Colors.greenAccent.withValues(alpha: 0.4),
+                          ),
                         ),
                         child: const Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(Icons.radar_rounded, color: Colors.greenAccent, size: 16),
+                            Icon(
+                              Icons.radar_rounded,
+                              color: Colors.greenAccent,
+                              size: 16,
+                            ),
                             SizedBox(width: 8),
-                            Text('Try Again', style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+                            Text(
+                              'Try Again',
+                              style: TextStyle(
+                                color: Colors.greenAccent,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -529,7 +853,44 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
               ),
             )
           else
-            ...List.generate(_filteredDevices.length, (i) => _buildDeviceCard(_filteredDevices[i])),
+            ...List.generate(
+              _filteredDevices.length,
+              (i) => _buildDeviceCard(_filteredDevices[i]),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // Says when the list may be out of date, and why.
+  Widget _buildListNote() {
+    final error = _controllerError;
+    final color = error != null ? Colors.orangeAccent : Colors.grey;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            error != null ? Icons.cloud_off_rounded : Icons.history_rounded,
+            size: 16,
+            color: color,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              error != null
+                  ? '$error${_devices.isEmpty ? '' : ' Showing the last scan.'}'
+                  : 'Showing the last scan. Updating...',
+              style: TextStyle(color: color, fontSize: 12),
+            ),
+          ),
+          if (error != null)
+            TextButton(onPressed: _refreshList, child: const Text('Retry')),
         ],
       ),
     );
@@ -540,20 +901,34 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
       onTap: _isScanning ? null : _startScan,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
+        alignment: Alignment.center,
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         decoration: BoxDecoration(
           color: _isScanning ? Colors.grey.shade800 : Colors.greenAccent,
           borderRadius: BorderRadius.circular(14),
-          boxShadow: _isScanning ? [] : [
-            BoxShadow(color: Colors.greenAccent.withValues(alpha: 0.3), blurRadius: 12, offset: const Offset(0, 4)),
-          ],
+          boxShadow:
+              _isScanning
+                  ? []
+                  : [
+                    BoxShadow(
+                      color: Colors.greenAccent.withValues(alpha: 0.3),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             if (_isScanning)
-              const SizedBox(width: 14, height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              )
             else
               const Icon(Icons.radar_rounded, size: 16, color: Colors.black),
             const SizedBox(width: 8),
@@ -591,8 +966,19 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
               child: Icon(icon, size: 16, color: color),
             ),
             const SizedBox(height: 6),
-            Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.white)),
-            Text(label, style: TextStyle(fontSize: 10, color: Colors.grey.shade500), overflow: TextOverflow.ellipsis),
+            Text(
+              value,
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 18,
+                color: Colors.white,
+              ),
+            ),
+            Text(
+              label,
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+              overflow: TextOverflow.ellipsis,
+            ),
           ],
         ),
       ),
@@ -607,9 +993,7 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
           return SizedBox(
             width: 150,
             height: 150,
-            child: CustomPaint(
-              painter: _RadarPainter(_pulseAnim.value),
-            ),
+            child: CustomPaint(painter: _RadarPainter(_pulseAnim.value)),
           );
         },
       ),
@@ -619,14 +1003,27 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
   Widget _buildDeviceCard(DiscoveredDevice dev) {
     final isAdopted = dev.status == AdoptStatus.adopted;
     final isAdopting = dev.status == AdoptStatus.adopting;
+    // An adopted box the controller reports offline needs attention.
+    final isOffline = isAdopted && dev.signal == 0;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
-        color: Colors.grey.shade900,
+        color:
+            isOffline
+                ? Color.alphaBlend(
+                  Colors.redAccent.withValues(alpha: 0.08),
+                  Colors.grey.shade900,
+                )
+                : Colors.grey.shade900,
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: isAdopted ? Colors.greenAccent.withValues(alpha: 0.5) : Colors.grey.shade800,
+          color:
+              isOffline
+                  ? Colors.redAccent
+                  : isAdopted
+                  ? Colors.greenAccent.withValues(alpha: 0.5)
+                  : Colors.grey.shade800,
           width: isAdopted ? 1.5 : 1,
         ),
       ),
@@ -644,7 +1041,11 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                     color: _typeColor(dev.type).withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: Icon(_typeIcon(dev.type), color: _typeColor(dev.type), size: 22),
+                  child: Icon(
+                    _typeIcon(dev.type),
+                    color: _typeColor(dev.type),
+                    size: 22,
+                  ),
                 ),
                 const SizedBox(width: 14),
                 // Name and IP
@@ -657,40 +1058,86 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                           Flexible(
                             child: Text(
                               dev.name,
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Colors.white),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                                color: Colors.white,
+                              ),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                           const SizedBox(width: 8),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 2,
+                            ),
                             decoration: BoxDecoration(
-                              color: _typeColor(dev.type).withValues(alpha: 0.18),
+                              color: _typeColor(
+                                dev.type,
+                              ).withValues(alpha: 0.18),
                               borderRadius: BorderRadius.circular(6),
                             ),
-                            child: Text(_typeLabel(dev.type),
-                                style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: _typeColor(dev.type))),
+                            child: Text(
+                              _typeLabel(dev.type),
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                color: _typeColor(dev.type),
+                              ),
+                            ),
                           ),
-                          if (isAdopted) ...[ 
+                          if (dev.type == DeviceType.tx &&
+                              dev.channel != null) ...[
                             const SizedBox(width: 6),
-                            const Icon(Icons.check_circle_rounded, size: 14, color: Colors.greenAccent),
+                            _channelBadge(dev.channel!),
+                          ],
+                          if (isAdopted) ...[
+                            const SizedBox(width: 6),
+                            const Icon(
+                              Icons.check_circle_rounded,
+                              size: 14,
+                              color: Colors.greenAccent,
+                            ),
                           ],
                         ],
                       ),
                       const SizedBox(height: 2),
                       Row(
                         children: [
-                          Text(dev.ip, style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                          Text(
+                            dev.ip,
+                            style: TextStyle(
+                              color: Colors.grey.shade500,
+                              fontSize: 12,
+                            ),
+                          ),
                           if (dev.type == DeviceType.cx) ...[
                             const SizedBox(width: 8),
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                              decoration: BoxDecoration(
-                                color: Colors.orangeAccent.withValues(alpha: 0.1),
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.2)),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 1,
                               ),
-                              child: const Text('AUTO-IP DISCOVERED', style: TextStyle(color: Colors.orangeAccent, fontSize: 8, fontWeight: FontWeight.w900)),
+                              decoration: BoxDecoration(
+                                color: Colors.orangeAccent.withValues(
+                                  alpha: 0.1,
+                                ),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: Colors.orangeAccent.withValues(
+                                    alpha: 0.2,
+                                  ),
+                                ),
+                              ),
+                              child: const Text(
+                                'AUTO-IP DISCOVERED',
+                                style: TextStyle(
+                                  color: Colors.orangeAccent,
+                                  fontSize: 8,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
                             ),
                           ],
                         ],
@@ -698,47 +1145,54 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                     ],
                   ),
                 ),
-                // Signal strength
-                Column(
-                  children: [
-                    Text('${dev.signal}%',
-                        style: TextStyle(color: _signalColor(dev.signal), fontWeight: FontWeight.bold, fontSize: 13)),
-                    const SizedBox(height: 2),
-                    Icon(Icons.signal_wifi_4_bar_rounded, size: 14, color: _signalColor(dev.signal)),
-                  ],
-                ),
               ],
             ),
             const SizedBox(height: 12),
             // MAC + Divider
             Row(
               children: [
-                Icon(Icons.memory_rounded, size: 12, color: Colors.grey.shade600),
+                Icon(
+                  Icons.memory_rounded,
+                  size: 12,
+                  color: Colors.grey.shade600,
+                ),
                 const SizedBox(width: 4),
-                Text('MAC: ${dev.mac}',
-                    style: TextStyle(color: Colors.grey.shade600, fontSize: 11)),
-                const Spacer(),
-                // Signal bar mini
-                _SignalBars(signal: dev.signal),
+                Flexible(
+                  child: Text(
+                    'MAC: ${dev.mac}',
+                    style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            // Signal progress + Adopt button
+            // Online status (as reported by the controller) + Adopt button
             Row(
               children: [
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  child: Row(
                     children: [
-                      Text('Signal Strength', style: TextStyle(color: Colors.grey.shade600, fontSize: 10)),
-                      const SizedBox(height: 4),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(4),
-                        child: LinearProgressIndicator(
-                          value: dev.signal / 100,
-                          minHeight: 5,
-                          backgroundColor: Colors.grey.shade800,
-                          valueColor: AlwaysStoppedAnimation<Color>(_signalColor(dev.signal)),
+                      Icon(
+                        Icons.circle,
+                        size: 8,
+                        color:
+                            dev.signal > 0
+                                ? Colors.greenAccent
+                                : Colors.redAccent,
+                      ),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          dev.signal > 0 ? 'Online' : 'Offline',
+                          style: TextStyle(
+                            color:
+                                dev.signal > 0
+                                    ? Colors.greenAccent
+                                    : Colors.redAccent,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
                     ],
@@ -747,33 +1201,69 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
                 const SizedBox(width: 16),
                 SizedBox(
                   height: 36,
-                  child: isAdopted
-                      ? Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          decoration: BoxDecoration(
-                            color: Colors.greenAccent.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.4)),
-                          ),
-                          alignment: Alignment.center,
-                          child: const Text('Adopted ✓',
-                              style: TextStyle(color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold)),
-                        )
-                      : ElevatedButton(
-                          onPressed: isAdopting ? null : () => _adoptDevice(dev),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.greenAccent,
-                            foregroundColor: Colors.black,
-                            disabledBackgroundColor: Colors.grey.shade800,
+                  child:
+                      isAdopted
+                          ? Container(
                             padding: const EdgeInsets.symmetric(horizontal: 16),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                            elevation: 0,
+                            decoration: BoxDecoration(
+                              color: (isOffline
+                                      ? Colors.redAccent
+                                      : Colors.greenAccent)
+                                  .withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: (isOffline
+                                        ? Colors.redAccent
+                                        : Colors.greenAccent)
+                                    .withValues(alpha: 0.4),
+                              ),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              isOffline ? 'Adopted · Offline' : 'Adopted ✓',
+                              style: TextStyle(
+                                color:
+                                    isOffline
+                                        ? Colors.redAccent
+                                        : Colors.greenAccent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          )
+                          : ElevatedButton(
+                            onPressed:
+                                isAdopting ? null : () => _adoptDevice(dev),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.greenAccent,
+                              foregroundColor: Colors.black,
+                              disabledBackgroundColor: Colors.grey.shade800,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              elevation: 0,
+                            ),
+                            child:
+                                isAdopting
+                                    ? const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.black,
+                                      ),
+                                    )
+                                    : const Text(
+                                      'Adopt',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 12,
+                                      ),
+                                    ),
                           ),
-                          child: isAdopting
-                              ? const SizedBox(width: 14, height: 14,
-                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
-                              : const Text('Adopt', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                        ),
                 ),
               ],
             ),
@@ -782,32 +1272,26 @@ class _DiscoveryModuleState extends State<DiscoveryModule>
       ),
     );
   }
+
+  Widget _channelBadge(String channel) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+    decoration: BoxDecoration(
+      color: Colors.orangeAccent.withValues(alpha: 0.14),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.3)),
+    ),
+    child: Text(
+      'Ch $channel',
+      style: const TextStyle(
+        color: Colors.orangeAccent,
+        fontSize: 10,
+        fontWeight: FontWeight.bold,
+      ),
+    ),
+  );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-
-class _SignalBars extends StatelessWidget {
-  final int signal;
-  const _SignalBars({required this.signal});
-  @override
-  Widget build(BuildContext context) {
-    Color color = signal >= 75 ? Colors.greenAccent : (signal >= 45 ? Colors.orangeAccent : Colors.redAccent);
-    return Row(
-      children: List.generate(4, (i) {
-        final active = signal >= (i + 1) * 25;
-        return Container(
-          margin: const EdgeInsets.only(left: 2),
-          width: 4,
-          height: 6.0 + i * 3,
-          decoration: BoxDecoration(
-            color: active ? color : Colors.grey.shade800,
-            borderRadius: BorderRadius.circular(2),
-          ),
-        );
-      }),
-    );
-  }
-}
 
 class _RadarPainter extends CustomPainter {
   final double progress;
@@ -831,13 +1315,17 @@ class _RadarPainter extends CustomPainter {
     }
 
     // Sweeping arc
-    final sweepPaint = Paint()
-      ..shader = SweepGradient(
-        colors: [Colors.transparent, Colors.greenAccent.withValues(alpha: 0.4)],
-        startAngle: -pi / 2,
-        endAngle: -pi / 2 + 2 * pi * progress,
-      ).createShader(Rect.fromCircle(center: center, radius: maxR))
-      ..style = PaintingStyle.fill;
+    final sweepPaint =
+        Paint()
+          ..shader = SweepGradient(
+            colors: [
+              Colors.transparent,
+              Colors.greenAccent.withValues(alpha: 0.4),
+            ],
+            startAngle: -pi / 2,
+            endAngle: -pi / 2 + 2 * pi * progress,
+          ).createShader(Rect.fromCircle(center: center, radius: maxR))
+          ..style = PaintingStyle.fill;
 
     canvas.drawArc(
       Rect.fromCircle(center: center, radius: maxR),
@@ -852,8 +1340,15 @@ class _RadarPainter extends CustomPainter {
 
     // Pulsing dot at edge of sweep
     final angle = -pi / 2 + 2 * pi * progress;
-    final dotPos = Offset(center.dx + maxR * cos(angle), center.dy + maxR * sin(angle));
-    canvas.drawCircle(dotPos, 4, Paint()..color = Colors.greenAccent.withValues(alpha: 0.8));
+    final dotPos = Offset(
+      center.dx + maxR * cos(angle),
+      center.dy + maxR * sin(angle),
+    );
+    canvas.drawCircle(
+      dotPos,
+      4,
+      Paint()..color = Colors.greenAccent.withValues(alpha: 0.8),
+    );
   }
 
   @override

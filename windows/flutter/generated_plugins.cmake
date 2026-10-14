@@ -3,6 +3,9 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
+  bonsoir_windows
+  connectivity_plus
+  flutter_blue_plus_winrt
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST

@@ -1,16 +1,16 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../logic/app_state.dart';
 import '../theme/app_theme.dart';
 import '../modules/operate_module.dart';
-import '../modules/previews_module.dart';
 import '../modules/discovery_module.dart';
 import '../modules/configuration_module.dart';
-import '../modules/troubleshooting_module.dart';
 import '../modules/snapshots_module.dart';
 import '../modules/help_module.dart';
-import '../modules/tests_module.dart';
 import '../modules/users_module.dart';
+import '../modules/utilities_module.dart';
 import '../screens/login_screen.dart';
+import '../config/session.dart';
 
 class AppShell extends StatefulWidget {
   final bool isAdmin;
@@ -20,49 +20,85 @@ class AppShell extends StatefulWidget {
   State<AppShell> createState() => _AppShellState();
 }
 
-class _AppShellState extends State<AppShell> {
-  int _selectedIndex = 0;
+class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
+  // Controller device ids (and so preview URLs) change when it restarts, so
+  // the device list is reloaded on screen open, on resume and on this timer.
+  static const Duration _deviceRefreshInterval = Duration(seconds: 45);
 
+  int _selectedIndex = 0;
+  Timer? _deviceRefreshTimer;
+
+  // 'id' is what AppState.currentTab holds (see AppTabs).
   final List<Map<String, dynamic>> _allNavItems = [
-    {'icon': Icons.grid_view_rounded, 'label': 'Live Previews', 'module': const PreviewsModule()},
-    {'icon': Icons.settings_input_component_outlined, 'label': 'Operate', 'module': const OperateModule()},
-    {'icon': Icons.manage_search_outlined, 'label': 'Discovery', 'adminOnly': true, 'module': const DiscoveryModule()},
-    {'icon': Icons.settings_outlined, 'label': 'Configuration', 'adminOnly': true, 'module': const ConfigurationModule()},
-    {'icon': Icons.admin_panel_settings_outlined, 'label': 'Access Control', 'adminOnly': true, 'module': const UsersModule()},
-    {'icon': Icons.build_outlined, 'label': 'Troubleshooting', 'adminOnly': true, 'module': const TroubleshootingModule()},
-    {'icon': Icons.camera_alt_outlined, 'label': 'Snapshots', 'module': const SnapshotsModule()},
-    {'icon': Icons.help_outline, 'label': 'Help', 'module': const HelpModule()},
-    {'icon': Icons.checklist_rtl_outlined, 'label': 'Tests', 'adminOnly': true, 'module': const TestsModule()},
+    {'id': AppTabs.discovery, 'icon': Icons.manage_search_outlined, 'label': 'Discovery', 'adminOnly': true, 'module': const DiscoveryModule()},
+    {'id': AppTabs.configuration, 'icon': Icons.settings_outlined, 'label': 'Configuration', 'adminOnly': true, 'module': const ConfigurationModule()},
+    {'id': AppTabs.operate, 'icon': Icons.settings_input_component_outlined, 'label': 'Operate', 'module': const OperateModule()},
+    {'id': AppTabs.snapshots, 'icon': Icons.camera_alt_outlined, 'label': 'Snapshots', 'module': const SnapshotsModule()},
+    {'id': AppTabs.users, 'icon': Icons.admin_panel_settings_outlined, 'label': 'User Management', 'adminOnly': true, 'module': const UsersModule()},
+    {'id': AppTabs.utilities, 'icon': Icons.monitor_heart_outlined, 'label': 'Utilities', 'adminOnly': true, 'module': const UtilitiesModule()},
+    {'id': AppTabs.help, 'icon': Icons.help_outline, 'label': 'Help', 'module': const HelpModule()},
   ];
+
+  List<Map<String, dynamic>> get _visibleItems =>
+      widget.isAdmin
+          ? _allNavItems
+          : _allNavItems.where((item) => item['adminOnly'] != true).toList();
 
   @override
   void initState() {
     super.initState();
-    AppState.instance.tabIndexNotifier.addListener(_syncTabIndex);
+    WidgetsBinding.instance.addObserver(this);
+    // Admins start in Discovery until a device is adopted; then, like
+    // everyone else, in Operate.
+    final hasDevices =
+        AppState.instance.sources.isNotEmpty ||
+        AppState.instance.destinationsByLocation.isNotEmpty;
+    final startTab =
+        widget.isAdmin && !hasDevices ? AppTabs.discovery : AppTabs.operate;
+    _selectedIndex = _visibleItems.indexWhere((i) => i['id'] == startTab);
+    AppState.instance.currentTab.value = startTab;
+    AppState.instance.currentTab.addListener(_syncTabIndex);
+    AppState.instance.refreshDevices();
+    _deviceRefreshTimer = Timer.periodic(_deviceRefreshInterval, (_) {
+      if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        AppState.instance.refreshDevices();
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) AppState.instance.refreshDevices();
+  }
+
+  // Tab changes go through the shared notifier so it always matches the
+  // visible tab (Discovery uses it to jump to Configuration after adopting).
+  void _selectTab(int index) {
+    AppState.instance.currentTab.value = _visibleItems[index]['id'] as String;
   }
 
   void _syncTabIndex() {
-    if (mounted) {
-      setState(() {
-        _selectedIndex = AppState.instance.tabIndexNotifier.value;
-      });
-    }
+    if (!mounted) return;
+    final index = _visibleItems.indexWhere(
+      (i) => i['id'] == AppState.instance.currentTab.value,
+    );
+    if (index < 0) return;
+    setState(() => _selectedIndex = index);
+    AppState.instance.refreshDevices();
   }
 
   @override
   void dispose() {
-    AppState.instance.tabIndexNotifier.removeListener(_syncTabIndex);
+    WidgetsBinding.instance.removeObserver(this);
+    _deviceRefreshTimer?.cancel();
+    AppState.instance.currentTab.removeListener(_syncTabIndex);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final List<Map<String, dynamic>> visibleItems = widget.isAdmin
-        ? _allNavItems
-        : _allNavItems.where((item) => item['adminOnly'] != true).toList();
-
-    // Ensure _selectedIndex is within bounds when admin mode changes
-    if (_selectedIndex >= visibleItems.length) {
+    final visibleItems = _visibleItems;
+    if (_selectedIndex < 0 || _selectedIndex >= visibleItems.length) {
       _selectedIndex = 0;
     }
 
@@ -127,6 +163,8 @@ class _AppShellState extends State<AppShell> {
                 icon: const Icon(Icons.logout_outlined, color: AppTheme.accentWhite, size: 20),
                 tooltip: 'Logout',
                 onPressed: () {
+                  // Logging out also ends "Remember me".
+                  Session.forget();
                   Navigator.pushReplacement(
                     context,
                     MaterialPageRoute(builder: (context) => const LoginScreen()),
@@ -224,7 +262,7 @@ class _AppShellState extends State<AppShell> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     style: ListTileStyle.drawer,
                     onTap: () {
-                      setState(() => _selectedIndex = index);
+                      _selectTab(index);
                       Navigator.pop(context);
                     },
                   );
@@ -236,7 +274,14 @@ class _AppShellState extends State<AppShell> {
       ),
       body: IndexedStack(
         index: _selectedIndex,
-        children: visibleItems.map((item) => item['module'] as Widget).toList(),
+        children: [
+          // Hidden tabs keep their state but stop tickers and preview polling.
+          for (int i = 0; i < visibleItems.length; i++)
+            TickerMode(
+              enabled: i == _selectedIndex,
+              child: visibleItems[i]['module'] as Widget,
+            ),
+        ],
       ),
     );
   }
